@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Liquid Blob Simulation</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            overflow: hidden; /* Prevents scrollbars */
+            background-color: #0f172a; /* bg-slate-900 */
+            cursor: none; /* Hide the default cursor */
+        }
+        canvas {
+            display: block;
+            background-color: #0f172a;
+        }
+    </style>
+</head>
+<body>
+    <div id="fps-counter" class="fixed top-2 left-2 text-white font-mono z-10">FPS: 0</div>
+    <canvas id="liquid-canvas"></canvas>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const canvas = document.getElementById('liquid-canvas');
+            const ctx = canvas.getContext('2d');
+            const fpsCounter = document.getElementById('fps-counter');
+            let frameTimes = [];
+            let fps = 0; // To be accessed by the spawner
+            
+            let width = canvas.width = window.innerWidth;
+            let height = canvas.height = window.innerHeight;
+
+            // --- Configuration ---
+            const NUM_BALLS = 150; 
+            const BLOB_RADIUS = 4; // Made blobs much smaller
+            const RENDER_RESOLUTION = 5; // Controls edge detail. Lower number = more edges/smoother, higher performance cost.
+            const ISO_THRESHOLD = 1.0;
+            const SHOW_BALLS = false;
+            const ATTRACTION_RADIUS = 50; // Smaller radius for tighter clusters
+            const ATTRACTION_STRENGTH = 0.04; // Stronger attraction
+            const VACUUM_INVERSE_SQUARE_STRENGTH = 3000; // The power of the inverse square pull.
+            const KILL_RADIUS = 10; // How close blobs must be to be sucked up (More precise)
+            const CURSOR_REPEL_RADIUS = 50; // How far the cursor's push effect reaches
+            const CURSOR_REPEL_STRENGTH = 20; // How strongly the cursor pushes blobs
+            const GRAVITATIONAL_CONSTANT = 0.5; // Slow ambient pull between all blobs
+
+            const mouse = {
+                x: width / 2,
+                y: height / 2,
+                px: width / 2,
+                py: height / 2,
+                vx: 0,
+                vy: 0
+            };
+            
+            let isSpawning = false;
+            let isSucking = false;
+
+            class Ball {
+                constructor(x, y, r) {
+                    this.x = x;
+                    this.y = y;
+                    this.px = x;
+                    this.py = y;
+                    this.vx = 0;
+                    this.vy = 0;
+                    this.r = r;
+                    this.mass = r; 
+                    this.color = `hsl(${Math.random() * 360}, 90%, 65%)`;
+                }
+
+                update() {
+                    this.vx = this.x - this.px;
+                    this.vy = this.y - this.py;
+                    
+                    this.px = this.x;
+                    this.py = this.y;
+                    
+                    // Friction / Damping - Increased to make clumps more inert
+                    this.vx *= 0.97;
+                    this.vy *= 0.97;
+
+                    this.x += this.vx;
+                    this.y += this.vy;
+
+                    // Boundary collision
+                    if (this.x < this.r) { this.x = this.r; this.vx *= -0.5; }
+                    if (this.x > width - this.r) { this.x = width - this.r; this.vx *= -0.5; }
+                    if (this.y < this.r) { this.y = this.r; this.vy *= -0.5; }
+                    if (this.y > height - this.r) { this.y = height - this.r; this.vy *= -0.5; }
+                }
+            }
+            
+            const balls = [];
+            
+            for (let i = 0; i < NUM_BALLS; i++) {
+                const r = BLOB_RADIUS;
+                const x = Math.random() * (width - 2 * r) + r;
+                const y = Math.random() * (height - 2 * r) + r;
+                balls.push(new Ball(x, y, r));
+            }
+
+            // --- Attraction Force ---
+            function applyAttractionForces() {
+                for (let i = 0; i < balls.length; i++) {
+                    for (let j = i + 1; j < balls.length; j++) {
+                        const ballA = balls[i];
+                        const ballB = balls[j];
+
+                        const dx = ballB.x - ballA.x;
+                        const dy = ballB.y - ballA.y;
+                        let distSq = dx * dx + dy * dy;
+
+                        // Using a minimum distance check to prevent extreme forces
+                        // This "softens" the gravity at close range to prevent explosions
+                        const minSafeDistSq = (ballA.r + ballB.r) * (ballA.r + ballB.r);
+                        if (distSq < minSafeDistSq) {
+                            distSq = minSafeDistSq;
+                        }
+
+                        const dist = Math.sqrt(distSq);
+                        const force = (GRAVITATIONAL_CONSTANT * ballA.mass * ballB.mass) / distSq;
+                        
+                        // Normalize the direction vector (dx, dy) and multiply by force
+                        const forceX = (dx / dist) * force;
+                        const forceY = (dy / dist) * force;
+                        
+                        // Apply force based on mass (a = F/m)
+                        ballA.x += forceX / ballA.mass;
+                        ballA.y += forceY / ballA.mass;
+                        ballB.x -= forceX / ballB.mass;
+                        ballB.y -= forceY / ballB.mass;
+                    }
+                }
+            }
+
+            // --- Cursor Repel Force ---
+            function applyCursorRepelForce() {
+                // When right-clicking to suck, the repel force is turned off.
+                if (isSucking) return; 
+
+                // This force is always active, allowing the cursor to push blobs around.
+                balls.forEach(ball => {
+                    const dx = ball.x - mouse.x;
+                    const dy = ball.y - mouse.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+
+                    if (dist < CURSOR_REPEL_RADIUS) {
+                        const angle = Math.atan2(dy, dx);
+                        // The force is stronger the closer the ball is to the cursor
+                        const forceMagnitude = (CURSOR_REPEL_RADIUS - dist) / CURSOR_REPEL_RADIUS * CURSOR_REPEL_STRENGTH;
+                        const acceleration = forceMagnitude / ball.mass;
+                        
+                        // Apply the force to push the ball away
+                        ball.x += Math.cos(angle) * acceleration;
+                        ball.y += Math.sin(angle) * acceleration;
+                    }
+                });
+            }
+
+            // --- Mouse Interactions ---
+            function handleMouseInteractions() {
+                // Only spawn new balls if the framerate is at a reasonable level
+                if (isSpawning && fps >= 30) {
+                    const newBall = new Ball(mouse.x, mouse.y, BLOB_RADIUS);
+                    // Create a random angle to radiate outwards from the cursor
+                    const angle = Math.random() * Math.PI * 2;
+                    const spawnSpeed = 2; // The initial speed of new balls
+                    newBall.vx = Math.cos(angle) * spawnSpeed;
+                    newBall.vy = Math.sin(angle) * spawnSpeed;
+                    balls.push(newBall);
+                }
+
+                if (isSucking) {
+                     for (let i = balls.length - 1; i >= 0; i--) {
+                        const ball = balls[i];
+                        const dx = mouse.x - ball.x;
+                        const dy = mouse.y - ball.y;
+                        const distSq = dx * dx + dy * dy;
+
+                        // Using squared distance for efficiency
+                        if (distSq < KILL_RADIUS * KILL_RADIUS) {
+                            balls.splice(i, 1);
+                        } else {
+                            // Apply inverse square law for vacuum pull
+                            const dist = Math.sqrt(distSq);
+                            const force = VACUUM_INVERSE_SQUARE_STRENGTH / distSq;
+                            
+                            // Normalized direction vector * force = acceleration vector
+                            const accX = (dx / dist) * force;
+                            const accY = (dy / dist) * force;
+
+                            ball.x += accX;
+                            ball.y += accY;
+                        }
+                    }
+                }
+            }
+
+            function drawCursor() {
+                const cursorColor = isSucking ? '#ef4444' : (isSpawning ? '#22c55e' : '#f8fafc');
+                
+                if(isSucking) {
+                    // Draw the inner kill radius indicator
+                    ctx.beginPath();
+                    ctx.arc(mouse.x, mouse.y, KILL_RADIUS, 0, Math.PI * 2);
+                    ctx.fillStyle = 'rgba(239, 68, 68, 0.3)';
+                    ctx.fill();
+                }
+
+                // Draw a small dot as the main cursor indicator
+                ctx.beginPath();
+                ctx.arc(mouse.x, mouse.y, 2, 0, Math.PI * 2);
+                ctx.fillStyle = cursorColor;
+                ctx.fill();
+            }
+
+            // --- Ball to Ball Collision ---
+            function handleCollisions() {
+                for (let i = 0; i < balls.length; i++) {
+                    for (let j = i + 1; j < balls.length; j++) {
+                        const ballA = balls[i];
+                        const ballB = balls[j];
+
+                        const dx = ballB.x - ballA.x;
+                        const dy = ballB.y - ballA.y;
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+                        const minDist = ballA.r + ballB.r;
+
+                        if (dist < minDist) {
+                            const angle = Math.atan2(dy, dx);
+                            const overlap = (minDist - dist);
+                            const totalMass = ballA.mass + ballB.mass;
+                            const overlapA = overlap * (ballB.mass / totalMass);
+                            const overlapB = overlap * (ballA.mass / totalMass);
+
+                            ballA.x -= Math.cos(angle) * overlapA;
+                            ballA.y -= Math.sin(angle) * overlapA;
+                            ballB.x += Math.cos(angle) * overlapB;
+                            ballB.y += Math.sin(angle) * overlapB;
+                        }
+                    }
+                }
+            }
+
+            // --- Marching Squares Implementation ---
+            let grid;
+            let cols, rows;
+
+            function calculateGrid() {
+                cols = Math.floor(width / RENDER_RESOLUTION) + 1;
+                rows = Math.floor(height / RENDER_RESOLUTION) + 1;
+                grid = new Array(cols);
+
+                for (let i = 0; i < cols; i++) {
+                    grid[i] = new Array(rows);
+                    for (let j = 0; j < rows; j++) {
+                        let value = 0;
+                        const gridX = i * RENDER_RESOLUTION;
+                        const gridY = j * RENDER_RESOLUTION;
+                        balls.forEach(ball => {
+                            const dx = gridX - ball.x;
+                            const dy = gridY - ball.y;
+                            value += ball.r * ball.r / (dx * dx + dy * dy);
+                        });
+                        grid[i][j] = value;
+                    }
+                }
+            }
+            
+            function lerp(a, b) {
+                return (ISO_THRESHOLD - a) / (b - a);
+            }
+
+            function drawIsolines() {
+                ctx.strokeStyle = '#f8fafc';
+                ctx.lineWidth = 3;
+                
+                for (let i = 0; i < cols - 1; i++) {
+                    for (let j = 0; j < rows - 1; j++) {
+                        const x = i * RENDER_RESOLUTION;
+                        const y = j * RENDER_RESOLUTION;
+
+                        const v00 = grid[i][j];
+                        const v10 = grid[i + 1][j];
+                        const v11 = grid[i + 1][j + 1];
+                        const v01 = grid[i][j + 1];
+
+                        let state = 0;
+                        if (v00 > ISO_THRESHOLD) state |= 8;
+                        if (v10 > ISO_THRESHOLD) state |= 4;
+                        if (v11 > ISO_THRESHOLD) state |= 2;
+                        if (v01 > ISO_THRESHOLD) state |= 1;
+
+                        const a = { x: x + lerp(v00, v10) * RENDER_RESOLUTION, y: y };
+                        const b = { x: x + RENDER_RESOLUTION, y: y + lerp(v10, v11) * RENDER_RESOLUTION };
+                        const c = { x: x + lerp(v01, v11) * RENDER_RESOLUTION, y: y + RENDER_RESOLUTION };
+                        const d = { x: x, y: y + lerp(v00, v01) * RENDER_RESOLUTION };
+                        
+                        ctx.beginPath();
+                        switch (state) {
+                            case 1: case 14: ctx.moveTo(d.x, d.y); ctx.lineTo(c.x, c.y); break;
+                            case 2: case 13: ctx.moveTo(c.x, c.y); ctx.lineTo(b.x, b.y); break;
+                            case 3: case 12: ctx.moveTo(d.x, d.y); ctx.lineTo(b.x, b.y); break;
+                            case 4: case 11: ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); break;
+                            case 5: ctx.moveTo(d.x, d.y); ctx.lineTo(a.x, a.y); ctx.moveTo(c.x, c.y); ctx.lineTo(b.x, b.y); break;
+                            case 6: case 9:  ctx.moveTo(a.x, a.y); ctx.lineTo(c.x, c.y); break;
+                            case 7: case 8:  ctx.moveTo(d.x, d.y); ctx.lineTo(a.x, a.y); break;
+                            case 10: ctx.moveTo(d.x, d.y); ctx.lineTo(c.x, c.y); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); break;
+                        }
+                        ctx.stroke();
+                    }
+                }
+            }
+
+
+            function animate() {
+                requestAnimationFrame(animate);
+
+                const now = performance.now();
+                // Remove frames older than 1 second
+                while (frameTimes.length > 0 && frameTimes[0] <= now - 1000) {
+                    frameTimes.shift();
+                }
+                frameTimes.push(now);
+                fps = frameTimes.length;
+                fpsCounter.textContent = `FPS: ${fps}`;
+
+                ctx.clearRect(0, 0, width, height);
+                
+                applyCursorRepelForce();
+                handleMouseInteractions();
+                applyAttractionForces();
+
+                balls.forEach(ball => {
+                   ball.update();
+                    if (SHOW_BALLS) {
+                        ctx.beginPath();
+                        ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+                        ctx.fillStyle = ball.color;
+                        ctx.fill();
+                    }
+                });
+
+                handleCollisions();
+
+                calculateGrid();
+                drawIsolines();
+                drawCursor();
+            }
+
+            window.addEventListener('resize', () => {
+                width = canvas.width = window.innerWidth;
+                height = canvas.height = window.innerHeight;
+            });
+
+            window.addEventListener('mousemove', (e) => {
+                mouse.px = mouse.x;
+                mouse.py = mouse.y;
+                mouse.x = e.clientX;
+                mouse.y = e.clientY;
+                mouse.vx = mouse.x - mouse.px;
+                mouse.vy = mouse.y - mouse.py;
+            });
+            
+            window.addEventListener('contextmenu', (e) => e.preventDefault());
+
+            window.addEventListener('mousedown', (e) => {
+                if (e.button === 0) isSpawning = true;
+                if (e.button === 2) isSucking = true;
+            });
+            
+            window.addEventListener('mouseup', (e) => {
+                if (e.button === 0) isSpawning = false;
+                if (e.button === 2) isSucking = false;
+            });
+
+            animate();
+        });
+    </script>
+</body>
+</html>
+
